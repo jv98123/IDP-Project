@@ -1,23 +1,25 @@
 """
 run_idp_esm2_on_bender.py
 
+## Usage
 
-Usage
------
-    # install dependencies first:
-    pip install transformers huggingface_hub torch pandas numpy tqdm
+```
+# install dependencies first:
+pip install transformers huggingface_hub torch pandas numpy tqdm
 
-    python run_idp_esm2_on_bender.py \\
-        --idrome    idrome_clustered.csv \\
-        --bender    merged.csv \\
-        --out       idp_esm2_results/ \\
-        --models    8M 150M
+python run_idp_esm2_on_bender.py \
+   --bender    merged.csv \
+   --out       idp_esm2_results/ \
+   --models    8M 150M
+```
 
-Dependencies
-------------
-    transformers >= 4.30
-    huggingface_hub
-    torch, numpy, pandas, tqdm
+## Dependencies
+
+```
+transformers >= 4.30
+huggingface_hub
+torch, numpy, pandas, tqdm
+```
 """
 
 import os
@@ -38,7 +40,10 @@ from transformers import AutoTokenizer, AutoModel
 # CONSTANTS
 # ─────────────────────────────────────────────
 
-TARGETS = ["rg", "ree", "nu", "delta"]
+# All targets — A0 is present in BENDER but absent from Human-IDRome CSV
+ALL_TARGETS    = ["rg", "ree", "nu", "delta", "a0"]
+IDROME_TARGETS = ["rg", "ree", "nu", "delta"]   # A0 absent from idrome release
+BENDER_TARGETS = ["rg", "ree", "nu", "delta", "a0"]
 
 # idrome column mapping
 IDROME_COL_MAP = {
@@ -47,11 +52,12 @@ IDROME_COL_MAP = {
     "Ree/nm":  "ree",
     "nu":      "nu",
     "Delta":   "delta",
+    "A0":      "a0",
 }
 
 # IDP-ESM2 model configs
 ESM2_MODELS = {
-    "8M":   {
+    "8M": {
         "hf_id":      "InstaDeepAI/IDP-ESM2-8M",
         "tokenizer":  "facebook/esm2_t6_8M_UR50D",
         "hidden_dim": 320,
@@ -63,14 +69,13 @@ ESM2_MODELS = {
     },
 }
 
-MAX_SEQ_LEN  = 256   # matching GeoGraph evaluation protocol
-BATCH_SIZE   = 32
-EMBED_BATCH  = 32    # batch size for embedding extraction
-HEAD_EPOCHS  = 200
+MAX_SEQ_LEN   = 256   # matching GeoGraph evaluation protocol
+BATCH_SIZE    = 32
+EMBED_BATCH   = 32    # batch size for embedding extraction
+HEAD_EPOCHS   = 200
 HEAD_PATIENCE = 20
-HEAD_LR      = 3e-3  # GeoGraph uses 3e-3 for GeoHead training
-HEAD_DROPOUT = 0.1
-
+HEAD_LR       = 3e-3  # GeoGraph uses 3e-3 for GeoHead training
+HEAD_DROPOUT  = 0.1
 
 # ─────────────────────────────────────────────
 # GeoHead MLP (matches GeoGraph architecture)
@@ -80,9 +85,11 @@ class GeoHead(nn.Module):
     """
     Shallow MLP prediction head — identical to GeoGraph's FeaturesHead.
     Input: mean-pooled ESM2 embeddings (hidden_dim,)
-    Output: 4 geometric targets (rg, ree, nu, delta)
+    Output: len(BENDER_TARGETS) geometric targets (rg, ree, nu, delta, a0)
+    Trained on BENDER training split including A0.
     """
-    def __init__(self, hidden_dim, n_out=4, dropout=HEAD_DROPOUT):
+    def __init__(self, hidden_dim, n_out=len(BENDER_TARGETS),
+                 dropout=HEAD_DROPOUT):
         super().__init__()
         self.head = nn.Sequential(
             nn.Linear(hidden_dim, 128),
@@ -98,26 +105,14 @@ class GeoHead(nn.Module):
         return sum(p.numel() for p in self.parameters()
                    if p.requires_grad)
 
-
 # ─────────────────────────────────────────────
 # DATA LOADING
 # ─────────────────────────────────────────────
 
-def load_idrome(path, max_seq_len=MAX_SEQ_LEN):
-    """Load idrome CSV, rename columns, filter to ≤256 residues."""
-    df = pd.read_csv(path)
-    df = df.rename(columns=IDROME_COL_MAP)
-    df = df.dropna(subset=["sequence"] + TARGETS)
-    n_before = len(df)
-    df = df[df["sequence"].str.len() <= max_seq_len].reset_index(drop=True)
-    print(f"idrome: {n_before} → {len(df)} sequences (≤{max_seq_len} aa)")
-    return df
-
-
 def load_bender(path, max_seq_len=MAX_SEQ_LEN):
     """Load BENDER merged CSV."""
     df = pd.read_csv(path)
-    df = df.dropna(subset=["sequence"] + TARGETS)
+    df = df.dropna(subset=["sequence"] + BENDER_TARGETS)
     n_before = len(df)
     df = df[df["sequence"].str.len() <= max_seq_len].reset_index(drop=True)
     print(f"BENDER: {n_before} → {len(df)} sequences (≤{max_seq_len} aa)")
@@ -154,7 +149,6 @@ def make_splits(df, train_frac=0.80, val_frac=0.10, seed=42):
               f"Train:{len(train)} Val:{len(val)} Test:{len(test)}")
     return train, val, test
 
-
 # ─────────────────────────────────────────────
 # EMBEDDING EXTRACTION
 # ─────────────────────────────────────────────
@@ -162,7 +156,7 @@ def make_splits(df, train_frac=0.80, val_frac=0.10, seed=42):
 def load_esm2(model_key, device):
     """Load frozen IDP-ESM2 backbone and tokenizer."""
     cfg = ESM2_MODELS[model_key]
-    print(f"\nLoading IDP-ESM2-{model_key} from {cfg['hf_id']} ...")
+    print(f"\nLoading IDP-ESM2-{model_key} from {cfg['hf_id']} …")
     tokenizer = AutoTokenizer.from_pretrained(cfg["tokenizer"])
     model     = AutoModel.from_pretrained(cfg["hf_id"])
     model.eval()
@@ -186,7 +180,7 @@ def extract_embeddings(sequences, tokenizer, esm_model, device,
                   desc="Extracting embeddings"):
         batch = sequences[i:i+batch_size]
         # truncate to max_len before tokenizing
-        batch = [s[:max_len] for s in batch]
+        batch  = [s[:max_len] for s in batch]
         inputs = tokenizer(
             batch,
             return_tensors="pt",
@@ -194,7 +188,7 @@ def extract_embeddings(sequences, tokenizer, esm_model, device,
             truncation=True,
             max_length=max_len + 2,  # +2 for special tokens
         )
-        inputs = {k: v.to(device) for k, v in inputs.items()}
+        inputs  = {k: v.to(device) for k, v in inputs.items()}
         outputs = esm_model(**inputs)
         hidden  = outputs.last_hidden_state  # (B, L, D)
 
@@ -206,22 +200,23 @@ def extract_embeddings(sequences, tokenizer, esm_model, device,
 
     return torch.cat(all_embs, dim=0)  # (N, D)
 
-
 # ─────────────────────────────────────────────
 # EMBEDDING DATASET
 # ─────────────────────────────────────────────
 
 class EmbeddingDataset(Dataset):
     """Dataset of precomputed embeddings + targets."""
-    def __init__(self, embeddings, targets_df, target_mean, target_std):
-        self.emb    = embeddings
-        self.tgt_raw = torch.tensor(
-            targets_df[TARGETS].values.astype(float),
+    def __init__(self, embeddings, targets_df, target_mean, target_std,
+                 targets=IDROME_TARGETS):
+        self.targets  = targets
+        self.emb      = embeddings
+        self.tgt_raw  = torch.tensor(
+            targets_df[targets].values.astype(float),
             dtype=torch.float32)
-        self.mean   = torch.tensor(target_mean, dtype=torch.float32)
-        self.std    = torch.tensor(target_std,  dtype=torch.float32)
-        self.tgt    = (self.tgt_raw - self.mean) / self.std
-        self.tgt    = torch.nan_to_num(self.tgt, nan=0.0)
+        self.mean     = torch.tensor(target_mean, dtype=torch.float32)
+        self.std      = torch.tensor(target_std,  dtype=torch.float32)
+        self.tgt      = (self.tgt_raw - self.mean) / self.std
+        self.tgt      = torch.nan_to_num(self.tgt, nan=0.0)
 
     def __len__(self):
         return len(self.emb)
@@ -229,7 +224,6 @@ class EmbeddingDataset(Dataset):
     def __getitem__(self, idx):
         return {"emb": self.emb[idx], "targets": self.tgt[idx],
                 "targets_raw": self.tgt_raw[idx]}
-
 
 # ─────────────────────────────────────────────
 # TRAINING
@@ -242,12 +236,14 @@ def train_geohead(hidden_dim, train_emb, val_emb,
     """Train GeoHead MLP on frozen ESM2 embeddings."""
     device = device or torch.device("cpu")
 
-    # normalisation stats from train set
-    t_mean = train_df[TARGETS].mean().values
-    t_std  = train_df[TARGETS].std().clip(lower=1e-6).values
+    # normalisation stats from BENDER train set
+    t_mean = train_df[IDROME_TARGETS].mean().values
+    t_std  = train_df[IDROME_TARGETS].std().clip(lower=1e-6).values
 
-    train_ds = EmbeddingDataset(train_emb, train_df, t_mean, t_std)
-    val_ds   = EmbeddingDataset(val_emb,   val_df,   t_mean, t_std)
+    train_ds = EmbeddingDataset(train_emb, train_df, t_mean, t_std,
+                                targets=IDROME_TARGETS)
+    val_ds   = EmbeddingDataset(val_emb,   val_df,   t_mean, t_std,
+                                targets=IDROME_TARGETS)
 
     train_dl = DataLoader(train_ds, batch_size=BATCH_SIZE,
                           shuffle=True,  num_workers=2)
@@ -291,7 +287,7 @@ def train_geohead(hidden_dim, train_emb, val_emb,
         vp  = torch.cat(vp);  vt_raw = torch.cat(vt_raw)
 
         # nu R² on val
-        nu_idx = TARGETS.index("nu")
+        nu_idx = IDROME_TARGETS.index("nu")
         y, yh  = vt_raw[:, nu_idx].numpy(), vp[:, nu_idx].numpy()
         nu_r2  = 1 - ((y-yh)**2).sum() / (((y-y.mean())**2).sum() + 1e-10)
 
@@ -313,16 +309,15 @@ def train_geohead(hidden_dim, train_emb, val_emb,
     model.load_state_dict(ckpt_data["state_dict"])
     return model, ckpt_data["t_mean"], ckpt_data["t_std"]
 
-
 # ─────────────────────────────────────────────
 # EVALUATION
 # ─────────────────────────────────────────────
 
-def r2_scores(preds, targets):
+def r2_scores(preds, targets_tensor, target_names):
     """Coefficient of determination for each target."""
     out = {}
-    for i, name in enumerate(TARGETS):
-        y, yh  = targets[:, i].numpy(), preds[:, i].numpy()
+    for i, name in enumerate(target_names):
+        y, yh  = targets_tensor[:, i].numpy(), preds[:, i].numpy()
         ss_res = ((y - yh)**2).sum()
         ss_tot = ((y - y.mean())**2).sum() + 1e-10
         out[name] = float(1 - ss_res / ss_tot)
@@ -344,25 +339,25 @@ def evaluate_on_df(model, embeddings, df, t_mean, t_std,
         preds.append(pred * t_std_t + t_mean_t)
     preds = torch.cat(preds)
 
-    targets = torch.tensor(df[TARGETS].values.astype(float),
-                           dtype=torch.float32)
-    r2 = r2_scores(preds, targets)
+    # evaluate only on targets the model was trained on
+    available = [t for t in IDROME_TARGETS if t in df.columns]
+    targets   = torch.tensor(df[available].values.astype(float),
+                             dtype=torch.float32)
+    r2 = r2_scores(preds, targets, available)
 
-    print(f"\n── {split_name} ({len(df)} sequences) ──────────────────")
-    print(f"  {'Target':<12} {'R²':>6}")
-    print(f"  {'──':<12} {'──':>6}")
+    print(f"\n-- {split_name} ({len(df)} sequences) ----------------")
+    print(f"  {'Target':<12} {'R2':>6}")
+    print(f"  {'--':<12} {'--':>6}")
     for tgt, score in r2.items():
         print(f"  {tgt:<12} {score:>6.4f}")
 
     return r2
 
-
 # ─────────────────────────────────────────────
 # MAIN
 # ─────────────────────────────────────────────
 
-def run(idrome_csv, bender_csv, out_dir, model_keys,
-        seed=42, device_str=None):
+def run(bender_csv, out_dir, model_keys, seed=42, device_str=None):
 
     os.makedirs(out_dir, exist_ok=True)
     torch.manual_seed(seed); np.random.seed(seed)
@@ -376,17 +371,16 @@ def run(idrome_csv, bender_csv, out_dir, model_keys,
 
     # ── load data ────────────────────────────────────────────────
     print("\n=== Loading data ===")
-    idrome_df = load_idrome(idrome_csv)
     bender_df = load_bender(bender_csv)
 
-    idrome_train, idrome_val, idrome_test = make_splits(idrome_df, seed=seed)
-    bender_ood  = bender_df[bender_df["kingdom"] == "Viruses"].copy()
-    bender_test = bender_df[bender_df["kingdom"] != "Viruses"].copy()
+    bender_ood     = bender_df[bender_df["kingdom"] == "Viruses"].copy()
+    bender_non_ood = bender_df[bender_df["kingdom"] != "Viruses"].copy()
+    bender_train, bender_val, bender_test = make_splits(bender_non_ood, seed=seed)
 
-    # filter bender test to same cluster split used by KESTREL
-    # (use all non-Viruses sequences as test — consistent with cross-kingdom eval)
-    print(f"\nBENDER test (non-Viruses): {len(bender_test)} sequences")
-    print(f"BENDER OOD (Viruses):      {len(bender_ood)} sequences")
+    print(f"\nBENDER train: {len(bender_train)} sequences")
+    print(f"BENDER val:   {len(bender_val)} sequences")
+    print(f"BENDER test:  {len(bender_test)} sequences")
+    print(f"BENDER OOD (Viruses): {len(bender_ood)} sequences")
 
     all_results = {}
 
@@ -401,44 +395,36 @@ def run(idrome_csv, bender_csv, out_dir, model_keys,
         tokenizer, esm_model, hidden_dim = load_esm2(model_key, device)
 
         # ── extract embeddings ───────────────────────────────────
-        print("\nExtracting idrome embeddings...")
-        idrome_train_emb = extract_embeddings(
-            idrome_train["sequence"].tolist(), tokenizer, esm_model, device)
-        idrome_val_emb   = extract_embeddings(
-            idrome_val["sequence"].tolist(),   tokenizer, esm_model, device)
-        idrome_test_emb  = extract_embeddings(
-            idrome_test["sequence"].tolist(),  tokenizer, esm_model, device)
-
         print("\nExtracting BENDER embeddings...")
-        bender_test_emb = extract_embeddings(
-            bender_test["sequence"].tolist(), tokenizer, esm_model, device)
-        bender_ood_emb  = extract_embeddings(
-            bender_ood["sequence"].tolist(),  tokenizer, esm_model, device)
+        bender_train_emb = extract_embeddings(
+            bender_train["sequence"].tolist(), tokenizer, esm_model, device)
+        bender_val_emb   = extract_embeddings(
+            bender_val["sequence"].tolist(),   tokenizer, esm_model, device)
+        bender_test_emb  = extract_embeddings(
+            bender_test["sequence"].tolist(),  tokenizer, esm_model, device)
+        bender_ood_emb   = extract_embeddings(
+            bender_ood["sequence"].tolist(),   tokenizer, esm_model, device)
 
         # free GPU memory from backbone
         esm_model.cpu()
         torch.cuda.empty_cache()
 
-        # ── train GeoHead on idrome ──────────────────────────────
+        # ── train GeoHead on BENDER ──────────────────────────────
         model, t_mean, t_std = train_geohead(
             hidden_dim,
-            idrome_train_emb, idrome_val_emb,
-            idrome_train,     idrome_val,
+            bender_train_emb, bender_val_emb,
+            bender_train,     bender_val,
             out_dir, name, device=device)
 
         # ── evaluate ─────────────────────────────────────────────
         results = {}
-        results["idrome_test"] = evaluate_on_df(
-            model, idrome_test_emb, idrome_test,
-            t_mean, t_std, f"{name} — idrome TEST", device)
-
         results["bender_test"] = evaluate_on_df(
             model, bender_test_emb, bender_test,
-            t_mean, t_std, f"{name} — BENDER TEST", device)
+            t_mean, t_std, f"{name} -- BENDER TEST", device)
 
         results["ood_viruses"] = evaluate_on_df(
             model, bender_ood_emb, bender_ood,
-            t_mean, t_std, f"{name} — OOD Viruses", device)
+            t_mean, t_std, f"{name} -- OOD Viruses", device)
 
         all_results[name] = results
 
@@ -451,19 +437,13 @@ def run(idrome_csv, bender_csv, out_dir, model_keys,
 
     # ── summary table ────────────────────────────────────────────
     print(f"\n{'='*70}")
-    print("SUMMARY — nu R² across splits")
-    print(f"{'Model':25s} {'idrome test':>12} {'BENDER test':>12} {'OOD Archaea':>12}")
-    print("─" * 65)
+    print("SUMMARY -- nu R2 across splits")
+    print(f"{'Model':25s} {'BENDER test':>12} {'OOD Viruses':>12}")
+    print("-" * 55)
     for name, results in all_results.items():
         print(f"{name:25s} "
-              f"{results['idrome_test']['nu']:>12.4f} "
               f"{results['bender_test']['nu']:>12.4f} "
               f"{results['ood_viruses']['nu']:>12.4f}")
-
-    # reference numbers
-    print("─" * 65)
-    print(f"{'GeoGraph (ref)':25s} {'0.8875':>12} {'—':>12} {'0.667':>12}")
-    print(f"{'KESTREL-CrossKingdom':25s} {'—':>12} {'0.825':>12} {'0.768':>12}")
 
     # save full summary
     rows = []
@@ -474,7 +454,6 @@ def run(idrome_csv, bender_csv, out_dir, model_keys,
         os.path.join(out_dir, "all_results.csv"), index=False)
     print(f"\nResults saved to {out_dir}")
 
-
 # ─────────────────────────────────────────────
 # CLI
 # ─────────────────────────────────────────────
@@ -482,45 +461,15 @@ def run(idrome_csv, bender_csv, out_dir, model_keys,
 if __name__ == "__main__":
     p = argparse.ArgumentParser(
         description="Evaluate IDP-ESM2 on BENDER via trained GeoHead")
-    p.add_argument("--idrome",   required=True,
-                   help="Path to idrome_clustered.csv")
-    p.add_argument("--bender",   required=True,
+    p.add_argument("--bender",  required=True,
                    help="Path to BENDER merged.csv")
-    p.add_argument("--out",      default="idp_esm2_results/",
+    p.add_argument("--out",     default="idp_esm2_results/",
                    help="Output directory")
-    p.add_argument("--models",   nargs="+", default=["8M", "150M"],
+    p.add_argument("--models",  nargs="+", default=["8M", "150M"],
                    choices=["8M", "150M"],
                    help="Which IDP-ESM2 models to run (default: both)")
-    p.add_argument("--seed",     default=42, type=int)
-    p.add_argument("--device",   default=None,
+    p.add_argument("--seed",    default=42, type=int)
+    p.add_argument("--device",  default=None,
                    help="Force device (cuda/cpu)")
     a = p.parse_args()
-    run(a.idrome, a.bender, a.out, a.models, a.seed, a.device)
-
-# ─────────────────────────────────────────────
-# USAGE
-# ─────────────────────────────────────────────
-#
-# Install:
-#   pip install transformers huggingface_hub torch pandas numpy tqdm
-#
-# Run both models:
-#   python run_idp_esm2_on_bender.py \\
-#       --idrome idrome_clustered.csv \\
-#       --bender merged.csv \\
-#       --out    idp_esm2_results/
-#
-# Run 8M only (faster):
-#   python run_idp_esm2_on_bender.py \\
-#       --idrome idrome_clustered.csv \\
-#       --bender merged.csv \\
-#       --out    idp_esm2_results/ \\
-#       --models 8M
-#
-# Output files:
-#   idp_esm2_results/IDP-ESM2-8M_results.csv
-#   idp_esm2_results/IDP-ESM2-150M_results.csv
-#   idp_esm2_results/all_results.csv
-#   idp_esm2_results/IDP-ESM2-8M_geohead_best.pt
-#   idp_esm2_results/IDP-ESM2-150M_geohead_best.pt
-# ─────────────────────────────────────────────
+    run(a.bender, a.out, a.models, a.seed, a.device)
